@@ -1,0 +1,563 @@
+<template>
+  <div class="home">
+    <el-card class="main-card" shadow="hover">
+      <!-- 上传区域 -->
+      <div class="upload-section">
+        <el-upload
+          ref="uploadRef"
+          class="upload-demo"
+          drag
+          :auto-upload="false"
+          :on-change="handleFileChange"
+          :file-list="fileList"
+          :limit="1"
+          accept=".pdf"
+          :disabled="uploading"
+        >
+          <el-icon class="el-icon--upload"><upload-filled /></el-icon>
+          <div class="el-upload__text">
+            将PDF文件拖到此处，或<em>点击上传</em>
+          </div>
+          <template #tip>
+            <div class="el-upload__tip">
+              只能上传PDF文件，且不超过10MB
+            </div>
+          </template>
+        </el-upload>
+
+        <div v-if="selectedFile" class="file-info">
+          <el-alert
+            :title="`已选择文件: ${selectedFile.name}`"
+            type="info"
+            :closable="false"
+            show-icon
+          />
+          <div class="action-buttons">
+            <el-button
+              type="primary"
+              :loading="uploading"
+              @click="handleUpload"
+              :disabled="!selectedFile"
+            >
+              <el-icon><upload /></el-icon>
+              上传文件
+            </el-button>
+            <el-button @click="clearFile">清空</el-button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 文件列表 -->
+      <div v-if="files.length > 0" class="files-section">
+        <h2>已上传的文件</h2>
+        <el-table :data="files" style="width: 100%" stripe>
+          <el-table-column prop="filename" label="文件名" width="300" />
+          <el-table-column label="文件大小" width="120">
+            <template #default="{ row }">
+              {{ formatFileSize(row.file_size) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="文本长度" width="120">
+            <template #default="{ row }">
+              {{ row.text_length }} 字符
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag v-if="!row.has_text" type="warning" size="small">无文本</el-tag>
+              <el-tag v-else-if="row.has_summary" type="success" size="small">已总结</el-tag>
+              <el-tag v-else type="info" size="small">未总结</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="上传时间" width="180">
+            <template #default="{ row }">
+              {{ formatDate(row.created_at) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" fixed="right" width="320">
+            <template #default="{ row }">
+              <el-button
+                type="success"
+                size="small"
+                @click="viewPDF(row.id)"
+              >
+                <el-icon><view /></el-icon>
+                查看PDF
+              </el-button>
+              <el-button
+                type="primary"
+                size="small"
+                :loading="summarizing[row.id]"
+                :disabled="!row.has_text"
+                @click="row.has_summary ? viewSummary(row.id) : handleSummarize(row.id)"
+              >
+                <el-icon><document /></el-icon>
+                {{ row.has_summary ? '查看总结' : '生成总结' }}
+              </el-button>
+              <el-button
+                type="danger"
+                size="small"
+                @click="handleDelete(row.id)"
+                :loading="deleting[row.id]"
+              >
+                <el-icon><delete /></el-icon>
+                删除
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <!-- 总结展示 -->
+      <div v-if="currentSummary" class="summary-section">
+        <h2>文档总结</h2>
+        <el-card class="summary-card">
+          <div class="summary-content" v-html="formatSummary(getSummaryContent())"></div>
+          <div v-if="getSummaryTokenUsed()" class="summary-meta">
+            <el-tag type="info">使用Token数: {{ getSummaryTokenUsed() }}</el-tag>
+          </div>
+        </el-card>
+      </div>
+    </el-card>
+
+    <!-- PDF查看对话框 -->
+    <el-dialog
+      v-model="showPDFDialog"
+      :title="currentPDFName"
+      width="90%"
+      top="5vh"
+      :close-on-click-modal="false"
+      destroy-on-close
+    >
+      <div class="pdf-viewer-container">
+        <iframe
+          v-if="pdfViewUrl"
+          :src="pdfViewUrl"
+          class="pdf-viewer"
+          frameborder="0"
+        ></iframe>
+      </div>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, reactive } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  UploadFilled,
+  Upload,
+  Document,
+  Delete,
+  View
+} from '@element-plus/icons-vue'
+import { marked } from 'marked'
+import { uploadPDF, getFiles, summarizePDF, deleteFile, getFileDetail } from '../api/upload'
+
+const uploadRef = ref(null)
+const fileList = ref([])
+const selectedFile = ref(null)
+const uploading = ref(false)
+const files = ref([])
+const currentSummary = ref(null)
+const summarizing = reactive({})
+const deleting = reactive({})
+const showPDFDialog = ref(false)
+const pdfViewUrl = ref('')
+const currentPDFName = ref('')
+
+// 加载文件列表
+const loadFiles = async () => {
+  try {
+    const response = await getFiles(0, 100)
+    if (response.success) {
+      files.value = response.data.files
+    }
+  } catch (error) {
+    ElMessage.error('加载文件列表失败: ' + error.message)
+  }
+}
+
+// 文件选择
+const handleFileChange = (file) => {
+  selectedFile.value = file.raw
+}
+
+// 清空文件
+const clearFile = () => {
+  selectedFile.value = null
+  fileList.value = []
+  uploadRef.value?.clearFiles()
+}
+
+// 上传文件
+const handleUpload = async () => {
+  if (!selectedFile.value) {
+    ElMessage.warning('请先选择文件')
+    return
+  }
+
+  uploading.value = true
+  try {
+    const response = await uploadPDF(selectedFile.value)
+    if (response.success) {
+      ElMessage.success('文件上传成功')
+      clearFile()
+      await loadFiles()
+    }
+  } catch (error) {
+    ElMessage.error('上传失败: ' + error.message)
+  } finally {
+    uploading.value = false
+  }
+}
+
+// 生成总结
+const handleSummarize = async (fileId) => {
+  summarizing[fileId] = true
+  try {
+    ElMessage.info('正在生成总结，请稍候...')
+    const response = await summarizePDF(fileId)
+    if (response.success) {
+      currentSummary.value = response.data
+      ElMessage.success('总结生成成功')
+      await loadFiles() // 刷新列表，更新状态
+    }
+  } catch (error) {
+    ElMessage.error('生成总结失败: ' + error.message)
+  } finally {
+    summarizing[fileId] = false
+  }
+}
+
+// 查看总结
+const viewSummary = async (fileId) => {
+  try {
+    const response = await getFileDetail(fileId)
+    if (response.success && response.data.summary) {
+      // getFileDetail返回的格式是 { data: { summary: { content: ..., token_used: ... } } }
+      // 我们需要将整个data对象赋值，这样summary字段就是包含content的对象
+      currentSummary.value = {
+        summary: response.data.summary
+      }
+    } else {
+      ElMessage.info('该文件还没有生成总结')
+      currentSummary.value = null
+    }
+  } catch (error) {
+    ElMessage.error('获取总结失败: ' + error.message)
+  }
+}
+
+// 删除文件
+const handleDelete = async (fileId) => {
+  try {
+    await ElMessageBox.confirm(
+      '确定要删除这个文件吗？删除后无法恢复。',
+      '确认删除',
+      {
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+        type: 'warning'
+      }
+    )
+
+    deleting[fileId] = true
+    const response = await deleteFile(fileId)
+    if (response.success) {
+      ElMessage.success('删除成功')
+      if (currentSummary.value && files.value.find(f => f.id === fileId)) {
+        currentSummary.value = null
+      }
+      await loadFiles()
+    }
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('删除失败: ' + error.message)
+    }
+  } finally {
+    deleting[fileId] = false
+  }
+}
+
+// 格式化文件大小
+const formatFileSize = (bytes) => {
+  if (!bytes) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i]
+}
+
+// 格式化日期
+const formatDate = (dateString) => {
+  if (!dateString) return ''
+  const date = new Date(dateString)
+  return date.toLocaleString('zh-CN')
+}
+
+// 获取总结内容（兼容两种数据结构）
+const getSummaryContent = () => {
+  if (!currentSummary.value) return ''
+  // 如果summary是字符串（来自summarizePDF）
+  if (typeof currentSummary.value.summary === 'string') {
+    return currentSummary.value.summary
+  }
+  // 如果summary是对象，包含content字段（来自getFileDetail）
+  if (currentSummary.value.summary && currentSummary.value.summary.content) {
+    return currentSummary.value.summary.content
+  }
+  // 兼容直接是content字段的情况
+  if (currentSummary.value.content) {
+    return currentSummary.value.content
+  }
+  return ''
+}
+
+// 获取Token使用数
+const getSummaryTokenUsed = () => {
+  if (!currentSummary.value) return null
+  // 如果summary是对象，包含token_used字段
+  if (currentSummary.value.summary && typeof currentSummary.value.summary === 'object') {
+    return currentSummary.value.summary.token_used
+  }
+  // 直接是token_used字段
+  return currentSummary.value.token_used || null
+}
+
+// 查看PDF文件
+const viewPDF = (fileId) => {
+  const file = files.value.find(f => f.id === fileId)
+  if (!file) return
+  
+  currentPDFName.value = file.filename
+  // 构建PDF查看URL，通过URL参数传递token（因为iframe无法设置Authorization header）
+  const token = localStorage.getItem('token') || sessionStorage.getItem('token')
+  pdfViewUrl.value = `/api/files/${fileId}/view`
+  
+  if (token) {
+    pdfViewUrl.value += `?token=${encodeURIComponent(token)}`
+  }
+  
+  showPDFDialog.value = true
+}
+
+// 格式化总结内容（Markdown转HTML）
+const formatSummary = (text) => {
+  if (!text) return ''
+  try {
+    // 使用marked将Markdown转换为HTML
+    return marked.parse(text, {
+      breaks: true, // 将单个换行符转换为<br>
+      gfm: true // 启用GitHub风格的Markdown
+    })
+  } catch (error) {
+    console.error('Markdown解析失败:', error)
+    // 如果解析失败，回退到简单处理
+    return text.replace(/\n/g, '<br>')
+  }
+}
+
+onMounted(() => {
+  loadFiles()
+})
+</script>
+
+<style scoped>
+.home {
+  width: 100%;
+}
+
+.main-card {
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 12px;
+}
+
+.upload-section {
+  margin-bottom: 40px;
+}
+
+.upload-demo {
+  width: 100%;
+}
+
+:deep(.el-upload-dragger) {
+  width: 100%;
+  padding: 40px;
+}
+
+.file-info {
+  margin-top: 20px;
+}
+
+.action-buttons {
+  margin-top: 15px;
+  display: flex;
+  gap: 10px;
+}
+
+.files-section {
+  margin-top: 40px;
+}
+
+.files-section h2 {
+  margin-bottom: 20px;
+  color: #333;
+}
+
+.summary-section {
+  margin-top: 40px;
+}
+
+.summary-section h2 {
+  margin-bottom: 20px;
+  color: #333;
+}
+
+.summary-card {
+  background: #f8f9fa;
+}
+
+.summary-content {
+  line-height: 1.8;
+  color: #333;
+  font-size: 15px;
+  word-wrap: break-word;
+}
+
+/* Markdown样式 */
+.summary-content :deep(h1) {
+  font-size: 24px;
+  font-weight: bold;
+  margin: 20px 0 15px 0;
+  padding-bottom: 10px;
+  border-bottom: 2px solid #e0e0e0;
+  color: #2c3e50;
+}
+
+.summary-content :deep(h2) {
+  font-size: 20px;
+  font-weight: bold;
+  margin: 18px 0 12px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e8e8e8;
+  color: #34495e;
+}
+
+.summary-content :deep(h3) {
+  font-size: 18px;
+  font-weight: bold;
+  margin: 15px 0 10px 0;
+  color: #34495e;
+}
+
+.summary-content :deep(h4) {
+  font-size: 16px;
+  font-weight: bold;
+  margin: 12px 0 8px 0;
+  color: #34495e;
+}
+
+.summary-content :deep(p) {
+  margin: 10px 0;
+  line-height: 1.8;
+}
+
+.summary-content :deep(ul),
+.summary-content :deep(ol) {
+  margin: 10px 0;
+  padding-left: 30px;
+}
+
+.summary-content :deep(li) {
+  margin: 6px 0;
+  line-height: 1.8;
+}
+
+.summary-content :deep(strong) {
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.summary-content :deep(em) {
+  font-style: italic;
+  color: #555;
+}
+
+.summary-content :deep(code) {
+  background-color: #f5f5f5;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+  color: #e83e8c;
+}
+
+.summary-content :deep(pre) {
+  background-color: #f5f5f5;
+  padding: 15px;
+  border-radius: 5px;
+  overflow-x: auto;
+  margin: 15px 0;
+}
+
+.summary-content :deep(pre code) {
+  background-color: transparent;
+  padding: 0;
+  color: #333;
+}
+
+.summary-content :deep(blockquote) {
+  border-left: 4px solid #409eff;
+  padding: 10px 15px;
+  margin: 15px 0;
+  color: #666;
+  background-color: #f9f9f9;
+}
+
+.summary-content :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 15px 0;
+}
+
+.summary-content :deep(th),
+.summary-content :deep(td) {
+  border: 1px solid #ddd;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.summary-content :deep(th) {
+  background-color: #f5f5f5;
+  font-weight: bold;
+}
+
+.summary-content :deep(hr) {
+  border: none;
+  border-top: 1px solid #e0e0e0;
+  margin: 20px 0;
+}
+
+.summary-meta {
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px solid #eee;
+}
+
+.pdf-viewer-container {
+  width: 100%;
+  height: 80vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #f5f5f5;
+}
+
+.pdf-viewer {
+  width: 100%;
+  height: 100%;
+  min-height: 600px;
+}
+</style>
+

@@ -1,0 +1,37 @@
+========================================
+PDF总结后端服务启动说明
+========================================
+
+问题：如果遇到 "ModuleNotFoundError: No module named 'sqlalchemy'" 错误
+
+原因：没有激活虚拟环境，Python找不到已安装的包
+
+解决方法（选择其一）：
+
+方法1：使用启动脚本（推荐）
+-------------------
+双击运行：start.bat
+
+方法2：手动激活虚拟环境
+-------------------
+1. 打开PowerShell或CMD
+2. 进入backend目录
+3. 激活虚拟环境：
+   PowerShell: .\venv\Scripts\Activate.ps1
+   CMD: venv\Scripts\activate.bat
+4. 运行：python main.py
+
+方法3：直接使用虚拟环境Python
+-------------------
+.\venv\Scripts\python.exe main.py
+
+========================================
+重要提示：
+========================================
+1. 确保虚拟环境已创建（venv目录存在）
+2. 确保依赖已安装（pip install -r requirements.txt）
+3. 确保.env文件已配置（包含数据库连接信息）
+4. 确保MySQL数据库已创建（pdf_summary）
+
+========================================
+
