@@ -161,17 +161,71 @@
         </el-table>
       </div>
 
-      <!-- 总结展示 -->
-      <div v-if="currentSummary" class="summary-section">
-        <h2>文档总结</h2>
-        <el-card class="summary-card">
-          <div class="summary-content" v-html="formatSummary(getSummaryContent())"></div>
+    </el-card>
+
+    <!-- 总结查看对话框 -->
+    <el-dialog
+      v-model="showSummaryDialog"
+      :title="currentSummaryFileName || '文档总结'"
+      :width="summaryDialogFullscreen ? '100%' : '75%'"
+      :top="summaryDialogFullscreen ? '0' : '5vh'"
+      :close-on-click-modal="false"
+      :fullscreen="summaryDialogFullscreen"
+      destroy-on-close
+      class="summary-dialog"
+    >
+      <template #header>
+        <div class="dialog-header">
+          <span>{{ currentSummaryFileName || '文档总结' }}</span>
+          <div class="dialog-header-actions">
+            <el-button
+              :icon="summaryDialogFullscreen ? Aim : FullScreen"
+              circle
+              size="small"
+              @click="toggleSummaryFullscreen"
+              title="全屏/退出全屏"
+            />
+          </div>
+        </div>
+      </template>
+      <div class="summary-dialog-container">
+        <!-- 左侧：大纲 -->
+        <div class="summary-outline-wrapper">
+          <div class="outline-header">
+            <h3>目录</h3>
+          </div>
+          <div class="outline-content">
+            <el-scrollbar :height="summaryDialogFullscreen ? 'calc(100vh - 120px)' : 'calc(80vh - 100px)'">
+              <ul class="outline-list">
+                <li
+                  v-for="(item, index) in summaryOutline"
+                  :key="index"
+                  :class="['outline-item', `outline-level-${item.level}`]"
+                  @click="scrollToHeading(item.id)"
+                >
+                  <span class="outline-text">{{ item.text }}</span>
+                </li>
+              </ul>
+              <div v-if="summaryOutline.length === 0" class="outline-empty">
+                暂无目录
+              </div>
+            </el-scrollbar>
+          </div>
+        </div>
+        
+        <!-- 右侧：总结内容 -->
+        <div class="summary-content-wrapper">
+          <div 
+            class="summary-content" 
+            id="summary-content"
+            v-html="formatSummary(getSummaryContent())"
+          ></div>
           <div v-if="getSummaryTokenUsed()" class="summary-meta">
             <el-tag type="info">使用Token数: {{ getSummaryTokenUsed() }}</el-tag>
           </div>
-        </el-card>
+        </div>
       </div>
-    </el-card>
+    </el-dialog>
 
     <!-- PDF查看对话框 -->
     <el-dialog
@@ -195,7 +249,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, reactive, computed } from 'vue'
+import { ref, onMounted, reactive, computed, watch, nextTick } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   UploadFilled,
@@ -203,7 +257,9 @@ import {
   Search,
   Document,
   Delete,
-  View
+  View,
+  FullScreen,
+  Aim
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { uploadPDF, getFiles, summarizePDF, deleteFile, getFileDetail } from '../api/upload'
@@ -220,6 +276,12 @@ const deleting = reactive({})
 const showPDFDialog = ref(false)
 const pdfViewUrl = ref('')
 const currentPDFName = ref('')
+
+// 总结对话框相关
+const showSummaryDialog = ref(false)
+const currentSummaryFileName = ref('')
+const summaryOutline = ref([])
+const summaryDialogFullscreen = ref(false)
 
 // 搜索相关
 const searchQuery = ref('')
@@ -289,6 +351,13 @@ const handleSummarize = async (fileId) => {
     const response = await summarizePDF(fileId)
     if (response.success) {
       currentSummary.value = response.data
+      // 获取文件名
+      const file = displayFiles.value.find(f => f.id === fileId)
+      currentSummaryFileName.value = file ? file.filename : '文档总结'
+      // 生成大纲
+      generateOutline()
+      // 打开对话框
+      showSummaryDialog.value = true
       ElMessage.success('总结生成成功')
       await loadFiles() // 刷新列表，更新状态
     }
@@ -309,6 +378,13 @@ const viewSummary = async (fileId) => {
       currentSummary.value = {
         summary: response.data.summary
       }
+      // 获取文件名
+      const file = displayFiles.value.find(f => f.id === fileId)
+      currentSummaryFileName.value = file ? file.filename : '文档总结'
+      // 生成大纲
+      generateOutline()
+      // 打开对话框
+      showSummaryDialog.value = true
     } else {
       ElMessage.info('该文件还没有生成总结')
       currentSummary.value = null
@@ -337,6 +413,7 @@ const handleDelete = async (fileId) => {
       ElMessage.success('删除成功')
       if (currentSummary.value && files.value.find(f => f.id === fileId)) {
         currentSummary.value = null
+        showSummaryDialog.value = false
       }
       await loadFiles()
     }
@@ -530,16 +607,145 @@ const formatSummary = (text) => {
   if (!text) return ''
   try {
     // 使用marked将Markdown转换为HTML
-    return marked.parse(text, {
+    const html = marked.parse(text, {
       breaks: true, // 将单个换行符转换为<br>
       gfm: true // 启用GitHub风格的Markdown
     })
+    
+    // 为标题添加ID，用于大纲跳转
+    return addHeadingIds(html)
   } catch (error) {
     console.error('Markdown解析失败:', error)
     // 如果解析失败，回退到简单处理
     return text.replace(/\n/g, '<br>')
   }
 }
+
+// 为HTML中的标题添加ID
+const addHeadingIds = (html) => {
+  if (!html) return ''
+  
+  // 匹配h1-h6标签，并添加ID
+  return html.replace(/<h([1-6])>(.*?)<\/h[1-6]>/gi, (match, level, content) => {
+    // 提取纯文本作为ID（移除HTML标签）
+    const text = content.replace(/<[^>]+>/g, '').trim()
+    // 生成ID：将文本转换为URL友好的格式
+    const id = 'heading-' + text
+      .toLowerCase()
+      .replace(/[^\w\u4e00-\u9fa5]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .substring(0, 50) // 限制长度
+    
+    return `<h${level} id="${id}">${content}</h${level}>`
+  })
+}
+
+// 从Markdown内容中提取大纲
+const generateOutline = () => {
+  const content = getSummaryContent()
+  if (!content) {
+    summaryOutline.value = []
+    return
+  }
+  
+  // 使用正则表达式匹配Markdown标题
+  const headingRegex = /^(#{1,6})\s+(.+)$/gm
+  const outline = []
+  let match
+  
+  while ((match = headingRegex.exec(content)) !== null) {
+    const level = match[1].length // #的数量就是级别
+    const text = match[2].trim()
+    
+    // 生成ID（与addHeadingIds中的逻辑一致）
+    const id = 'heading-' + text
+      .toLowerCase()
+      .replace(/[^\w\u4e00-\u9fa5]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .substring(0, 50)
+    
+    outline.push({
+      level,
+      text,
+      id
+    })
+  }
+  
+  summaryOutline.value = outline
+  
+  // 如果对话框已打开，等待DOM更新后处理
+  if (showSummaryDialog.value) {
+    setTimeout(() => {
+      // 确保标题ID已添加到DOM中
+      outline.forEach(item => {
+        const element = document.getElementById(item.id)
+        if (!element) {
+          // 如果找不到，尝试在格式化后的HTML中查找
+          const contentElement = document.getElementById('summary-content')
+          if (contentElement) {
+            const headings = contentElement.querySelectorAll('h1, h2, h3, h4, h5, h6')
+            headings.forEach((heading, index) => {
+              if (heading.textContent.trim() === item.text && !heading.id) {
+                heading.id = item.id
+              }
+            })
+          }
+        }
+      })
+    }, 100)
+  }
+}
+
+// 点击大纲项，滚动到对应标题
+const scrollToHeading = (id) => {
+  const element = document.getElementById(id)
+  if (element) {
+    element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    // 高亮一下
+    element.style.transition = 'background-color 0.3s'
+    element.style.backgroundColor = '#fff3cd'
+    setTimeout(() => {
+      element.style.backgroundColor = ''
+    }, 2000)
+  }
+}
+
+// 切换全屏
+const toggleSummaryFullscreen = () => {
+  summaryDialogFullscreen.value = !summaryDialogFullscreen.value
+}
+
+// 监听对话框打开，确保大纲正确生成
+watch(showSummaryDialog, async (newVal) => {
+  if (newVal) {
+    // 等待DOM更新
+    await nextTick()
+    // 重新生成大纲（确保标题ID已添加到DOM）
+    generateOutline()
+    // 再次等待，确保所有标题ID都已添加
+    setTimeout(() => {
+      // 验证并修复标题ID
+      summaryOutline.value.forEach(item => {
+        const element = document.getElementById(item.id)
+        if (!element) {
+          // 如果找不到，尝试在格式化后的HTML中查找
+          const contentElement = document.getElementById('summary-content')
+          if (contentElement) {
+            const headings = contentElement.querySelectorAll('h1, h2, h3, h4, h5, h6')
+            headings.forEach((heading) => {
+              if (heading.textContent.trim() === item.text && !heading.id) {
+                heading.id = item.id
+              }
+            })
+          }
+        }
+      })
+    }, 200)
+  } else {
+    // 对话框关闭时，重置全屏状态
+    summaryDialogFullscreen.value = false
+  }
+})
 
 onMounted(() => {
   loadFiles()
@@ -810,6 +1016,156 @@ onMounted(() => {
   border-radius: 3px;
   font-weight: 600;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+/* 总结对话框样式 */
+.summary-dialog-container {
+  display: flex;
+  gap: 20px;
+  min-height: 70vh;
+}
+
+.summary-outline-wrapper {
+  width: 280px;
+  flex-shrink: 0;
+  background: #f8f9fa;
+  border-radius: 8px;
+  padding: 15px;
+  border-right: 1px solid #e0e0e0;
+}
+
+.summary-content-wrapper {
+  flex: 1;
+  min-width: 0;
+  padding-left: 20px;
+}
+
+.outline-header {
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid #e0e0e0;
+}
+
+.outline-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #303133;
+}
+
+
+.outline-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.outline-item {
+  padding: 8px 12px;
+  margin: 4px 0;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.2s;
+  border-left: 3px solid transparent;
+}
+
+.outline-item:hover {
+  background-color: #e6f7ff;
+  border-left-color: #409eff;
+  transform: translateX(3px);
+}
+
+.outline-level-1 {
+  font-weight: 600;
+  font-size: 15px;
+  color: #2c3e50;
+  padding-left: 12px;
+}
+
+.outline-level-2 {
+  font-weight: 500;
+  font-size: 14px;
+  color: #34495e;
+  padding-left: 24px;
+}
+
+.outline-level-3 {
+  font-size: 13px;
+  color: #555;
+  padding-left: 36px;
+}
+
+.outline-level-4 {
+  font-size: 12px;
+  color: #666;
+  padding-left: 48px;
+}
+
+.outline-level-5,
+.outline-level-6 {
+  font-size: 12px;
+  color: #777;
+  padding-left: 60px;
+}
+
+.outline-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outline-empty {
+  text-align: center;
+  color: #909399;
+  padding: 40px 20px;
+  font-size: 14px;
+}
+
+/* 总结内容区域样式调整 */
+.summary-dialog .summary-content {
+  line-height: 1.8;
+  color: #333;
+  font-size: 15px;
+  word-wrap: break-word;
+  overflow-y: auto;
+  padding-right: 10px;
+  max-height: calc(80vh - 150px);
+}
+
+/* 全屏模式下的内容高度 */
+.summary-dialog.is-fullscreen .summary-content {
+  max-height: calc(100vh - 180px);
+}
+
+/* 对话框头部样式 */
+.dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.dialog-header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 为标题添加滚动锚点样式 */
+.summary-content :deep(h1),
+.summary-content :deep(h2),
+.summary-content :deep(h3),
+.summary-content :deep(h4),
+.summary-content :deep(h5),
+.summary-content :deep(h6) {
+  scroll-margin-top: 20px;
+  position: relative;
+}
+
+.summary-dialog .summary-meta {
+  margin-top: 20px;
+  padding-top: 15px;
+  border-top: 1px solid #eee;
 }
 </style>
 
