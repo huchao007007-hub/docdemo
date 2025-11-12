@@ -47,10 +47,47 @@
         </div>
       </div>
 
+      <!-- 搜索区域 -->
+      <div v-if="files.length > 0" class="search-section">
+        <h2>文件搜索</h2>
+        <div class="search-box">
+          <el-input
+            v-model="searchQuery"
+            placeholder="输入关键词进行语义搜索（支持搜索文件名和内容）"
+            clearable
+            @keyup.enter="handleSearch"
+            @clear="handleClearSearch"
+          >
+            <template #prefix>
+              <el-icon><search /></el-icon>
+            </template>
+            <template #append>
+              <el-button
+                type="primary"
+                :loading="searching"
+                @click="handleSearch"
+              >
+                搜索
+              </el-button>
+            </template>
+          </el-input>
+          <div v-if="searchResults.length > 0" class="search-results-info">
+            <el-tag type="success">找到 {{ searchResults.length }} 个相关文件</el-tag>
+            <el-button
+              type="text"
+              size="small"
+              @click="handleClearSearch"
+            >
+              清除搜索
+            </el-button>
+          </div>
+        </div>
+      </div>
+
       <!-- 文件列表 -->
       <div v-if="files.length > 0" class="files-section">
-        <h2>已上传的文件</h2>
-        <el-table :data="files" style="width: 100%" stripe>
+        <h2>{{ isSearchMode ? '搜索结果' : '已上传的文件' }}</h2>
+        <el-table :data="displayFiles" style="width: 100%" stripe>
           <el-table-column prop="filename" label="文件名" width="300" />
           <el-table-column label="文件大小" width="120">
             <template #default="{ row }">
@@ -60,6 +97,22 @@
           <el-table-column label="文本长度" width="120">
             <template #default="{ row }">
               {{ row.text_length }} 字符
+            </template>
+          </el-table-column>
+          <el-table-column v-if="isSearchMode" label="相似度" width="100">
+            <template #default="{ row }">
+              <el-tag :type="row.similarity_score > 0.7 ? 'success' : row.similarity_score > 0.5 ? 'warning' : 'info'">
+                {{ (row.similarity_score * 100).toFixed(1) }}%
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column v-if="isSearchMode" label="匹配内容" width="400" min-width="300">
+            <template #default="{ row }">
+              <div 
+                class="match-content" 
+                v-html="highlightMatchText(row.match_text, searchQuery)"
+                :title="row.match_text"
+              ></div>
             </template>
           </el-table-column>
           <el-table-column label="状态" width="120">
@@ -142,17 +195,19 @@
 </template>
 
 <script setup>
-import { ref, onMounted, reactive } from 'vue'
+import { ref, onMounted, reactive, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   UploadFilled,
   Upload,
+  Search,
   Document,
   Delete,
   View
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import { uploadPDF, getFiles, summarizePDF, deleteFile, getFileDetail } from '../api/upload'
+import { searchPDFs } from '../api/search'
 
 const uploadRef = ref(null)
 const fileList = ref([])
@@ -165,6 +220,20 @@ const deleting = reactive({})
 const showPDFDialog = ref(false)
 const pdfViewUrl = ref('')
 const currentPDFName = ref('')
+
+// 搜索相关
+const searchQuery = ref('')
+const searching = ref(false)
+const searchResults = ref([])
+const isSearchMode = computed(() => searchResults.value.length > 0)
+
+// 计算显示的文件列表（搜索模式显示搜索结果，否则显示所有文件）
+const displayFiles = computed(() => {
+  if (isSearchMode.value) {
+    return searchResults.value
+  }
+  return files.value
+})
 
 // 加载文件列表
 const loadFiles = async () => {
@@ -325,9 +394,123 @@ const getSummaryTokenUsed = () => {
   return currentSummary.value.token_used || null
 }
 
+// 语义搜索
+const handleSearch = async () => {
+  if (!searchQuery.value || !searchQuery.value.trim()) {
+    ElMessage.warning('请输入搜索关键词')
+    return
+  }
+
+  searching.value = true
+  try {
+    const response = await searchPDFs(searchQuery.value.trim(), 20, 0.3)
+    if (response.success) {
+      searchResults.value = response.data.results
+      if (searchResults.value.length === 0) {
+        ElMessage.info('未找到相关文件，请尝试其他关键词')
+      } else {
+        ElMessage.success(`找到 ${searchResults.value.length} 个相关文件`)
+      }
+    }
+  } catch (error) {
+    ElMessage.error('搜索失败: ' + error.message)
+    searchResults.value = []
+  } finally {
+    searching.value = false
+  }
+}
+
+// 清除搜索
+const handleClearSearch = () => {
+  searchQuery.value = ''
+  searchResults.value = []
+}
+
+// 高亮匹配文本
+const highlightMatchText = (text, query) => {
+  if (!text || !query) {
+    return escapeHtml(text || '')
+  }
+  
+  // 转义HTML，防止XSS攻击
+  const escapedText = escapeHtml(text)
+  const escapedQuery = escapeHtml(query.trim())
+  
+  if (!escapedQuery) {
+    return escapedText
+  }
+  
+  let highlightedText = escapedText
+  
+  // 首先高亮完整的查询词（优先级最高，使用更醒目的样式）
+  const fullQueryRegex = new RegExp(`(${escapeRegex(escapedQuery)})`, 'gi')
+  highlightedText = highlightedText.replace(fullQueryRegex, (match) => {
+    return `<mark class="highlight-match-full">${match}</mark>`
+  })
+  
+  // 如果查询词包含多个关键词（用空格分隔），也高亮单个关键词
+  // 但只高亮不在完整查询词高亮内的部分
+  const keywords = escapedQuery.split(/\s+/).filter(k => k.length > 1)
+  
+  if (keywords.length > 0) {
+    // 创建一个临时标记来避免重复高亮
+    const tempMarker = '___TEMP_MARKER___'
+    highlightedText = highlightedText.replace(/<mark class="highlight-match-full">([^<]*)<\/mark>/gi, 
+      (match, content) => `${tempMarker}${content}${tempMarker}`)
+    
+    // 高亮关键词
+    keywords.forEach(keyword => {
+      const keywordRegex = new RegExp(`(${escapeRegex(keyword)})`, 'gi')
+      highlightedText = highlightedText.replace(keywordRegex, (match, p1, offset) => {
+        // 检查是否在临时标记内（即已被完整查询词高亮）
+        const beforeText = highlightedText.substring(0, offset)
+        const lastMarkerStart = beforeText.lastIndexOf(tempMarker)
+        const lastMarkerEnd = beforeText.lastIndexOf(tempMarker, offset + match.length)
+        
+        if (lastMarkerStart !== -1 && lastMarkerEnd > lastMarkerStart) {
+          // 在标记内，不处理
+          return match
+        }
+        
+        // 检查是否已经在mark标签内
+        const beforeMatch = highlightedText.substring(0, offset)
+        const lastMarkStart = beforeMatch.lastIndexOf('<mark')
+        const lastMarkEnd = beforeMatch.lastIndexOf('</mark>')
+        
+        if (lastMarkStart > lastMarkEnd) {
+          // 已经在mark标签内
+          return match
+        }
+        
+        return `<mark class="highlight-match">${match}</mark>`
+      })
+    })
+    
+    // 恢复完整查询词的高亮
+    highlightedText = highlightedText.replace(new RegExp(`${tempMarker}([^${tempMarker}]*)${tempMarker}`, 'g'),
+      (match, content) => `<mark class="highlight-match-full">${content}</mark>`)
+  }
+  
+  return highlightedText
+}
+
+// 转义HTML
+const escapeHtml = (text) => {
+  if (!text) return ''
+  const div = document.createElement('div')
+  div.textContent = text
+  return div.innerHTML
+}
+
+// 转义正则表达式特殊字符
+const escapeRegex = (str) => {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 // 查看PDF文件
 const viewPDF = (fileId) => {
-  const file = files.value.find(f => f.id === fileId)
+  // 从显示的文件列表中查找（可能是搜索结果或全部文件）
+  const file = displayFiles.value.find(f => f.id === fileId)
   if (!file) return
   
   currentPDFName.value = file.filename
@@ -558,6 +741,75 @@ onMounted(() => {
   width: 100%;
   height: 100%;
   min-height: 600px;
+}
+
+.search-section {
+  margin-bottom: 20px;
+}
+
+.search-section h2 {
+  margin-bottom: 15px;
+  font-size: 18px;
+  color: #303133;
+}
+
+.search-box {
+  margin-bottom: 10px;
+}
+
+.search-results-info {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.match-content {
+  max-width: 100%;
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  /* 限制最大高度，超出显示省略号 */
+  max-height: 4.8em; /* 约3行 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  padding: 4px 0;
+  cursor: pointer;
+  transition: max-height 0.3s ease;
+}
+
+.match-content:hover {
+  max-height: none;
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  overflow: visible;
+  background-color: #f5f7fa;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+/* 高亮样式 */
+.match-content :deep(.highlight-match) {
+  background-color: #fff3cd;
+  color: #856404;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.match-content :deep(.highlight-match-full) {
+  background-color: #ffc107;
+  color: #000;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 </style>
 

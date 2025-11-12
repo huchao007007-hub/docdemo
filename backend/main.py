@@ -49,6 +49,30 @@ pdf_parser = PDFParser()
 ai_service = AIService()
 auth_service = AuthService()
 
+# 初始化向量服务（延迟初始化，在后台线程中加载，不阻塞服务启动）
+vector_service = None
+VECTOR_SEARCH_AVAILABLE = False
+
+def init_vector_service():
+    """延迟初始化向量服务（在后台线程中执行，不阻塞主服务）"""
+    global vector_service, VECTOR_SEARCH_AVAILABLE
+    try:
+        from services.vector_service import VectorService
+        logger.info("开始初始化向量搜索服务...")
+        vector_service = VectorService()
+        VECTOR_SEARCH_AVAILABLE = True
+        logger.info("向量搜索服务初始化成功")
+    except Exception as e:
+        logger.warning(f"向量搜索服务初始化失败: {str(e)}，语义搜索功能将不可用")
+        vector_service = None
+        VECTOR_SEARCH_AVAILABLE = False
+
+# 在后台线程中初始化向量服务，不阻塞主服务启动
+import threading
+vector_init_thread = threading.Thread(target=init_vector_service, daemon=True)
+vector_init_thread.start()
+logger.info("向量搜索服务将在后台初始化，不影响其他功能")
+
 # JWT认证
 security = HTTPBearer(auto_error=False)  # 允许可选认证，用于PDF查看
 security_required = HTTPBearer()  # 必需认证
@@ -232,6 +256,20 @@ async def upload_pdf(
         db.refresh(pdf_record)
         
         logger.info(f"PDF文件上传成功: {file.filename}, ID: {pdf_record.id}")
+        
+        # 如果提取到文本，生成向量并存储到Qdrant（用于语义搜索）
+        if text_content and VECTOR_SEARCH_AVAILABLE and vector_service:
+            try:
+                logger.info(f"开始为PDF生成向量: {pdf_record.id}")
+                vector_service.add_document(
+                    pdf_file_id=pdf_record.id,
+                    user_id=current_user.id,
+                    filename=pdf_record.original_filename,
+                    text_content=text_content
+                )
+                logger.info(f"PDF向量生成成功: {pdf_record.id}")
+            except Exception as e:
+                logger.error(f"生成PDF向量失败: {str(e)}，但不影响文件上传")
         
         # 根据是否提取到文本返回不同的消息
         if not text_content:
@@ -564,6 +602,13 @@ async def delete_file(
         if os.path.exists(pdf_file.file_path):
             os.remove(pdf_file.file_path)
         
+        # 删除向量（如果存在）
+        if VECTOR_SEARCH_AVAILABLE and vector_service:
+            try:
+                vector_service.delete_document(pdf_file.id, current_user.id)
+            except Exception as e:
+                logger.warning(f"删除向量失败: {str(e)}，继续删除文件")
+        
         # 删除数据库记录（级联删除总结）
         db.query(Summary).filter(Summary.pdf_file_id == file_id).delete()
         db.delete(pdf_file)
@@ -581,6 +626,92 @@ async def delete_file(
     except Exception as e:
         logger.error(f"删除文件失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
+
+# ==================== 语义搜索接口 ====================
+
+@app.get("/api/search")
+async def semantic_search(
+    q: str,
+    limit: int = 10,
+    score_threshold: float = 0.5,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    语义搜索PDF文件
+    
+    Args:
+        q: 搜索查询文本
+        limit: 返回结果数量（默认10）
+        score_threshold: 相似度阈值（0-1，默认0.5）
+        db: 数据库会话
+        current_user: 当前用户
+        
+    Returns:
+        搜索结果列表
+    """
+    try:
+        if not VECTOR_SEARCH_AVAILABLE or not vector_service:
+            raise HTTPException(
+                status_code=503,
+                detail="语义搜索功能不可用，请检查Qdrant服务配置"
+            )
+        
+        if not q or len(q.strip()) == 0:
+            raise HTTPException(status_code=400, detail="搜索查询不能为空")
+        
+        # 执行语义搜索
+        search_results = vector_service.search(
+            query=q.strip(),
+            user_id=current_user.id,
+            limit=limit,
+            score_threshold=score_threshold
+        )
+        
+        # 从数据库获取完整的文件信息
+        file_list = []
+        for result in search_results:
+            pdf_file_id = result["pdf_file_id"]
+            
+            # 验证文件属于当前用户
+            pdf_file = db.query(PDFFile).filter(
+                PDFFile.id == pdf_file_id,
+                PDFFile.user_id == current_user.id
+            ).first()
+            
+            if pdf_file:
+                # 检查是否有总结
+                has_summary = db.query(Summary).filter(
+                    Summary.pdf_file_id == pdf_file_id
+                ).first() is not None
+                
+                file_list.append({
+                    "id": pdf_file.id,
+                    "filename": pdf_file.original_filename,
+                    "file_size": pdf_file.file_size,
+                    "text_length": len(pdf_file.text_content) if pdf_file.text_content else 0,
+                    "has_text": pdf_file.text_content is not None,
+                    "has_summary": has_summary,
+                    "created_at": pdf_file.created_at.isoformat(),
+                    "match_type": result["type"],  # filename 或 content
+                    "match_text": result["text"][:200] + "..." if len(result["text"]) > 200 else result["text"],  # 匹配的文本片段
+                    "similarity_score": round(result["score"], 4)  # 相似度分数
+                })
+        
+        return JSONResponse({
+            "success": True,
+            "data": {
+                "query": q,
+                "results": file_list,
+                "total": len(file_list)
+            }
+        })
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"语义搜索失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -23,6 +23,14 @@ PORT=8000
 # OCR配置（可选，如果Tesseract和Poppler不在PATH中）
 # TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
 # POPPLER_PATH=C:\poppler\Library\bin
+
+# HuggingFace镜像源配置（如果无法访问huggingface.co，推荐使用）
+# HF_ENDPOINT=https://hf-mirror.com
+
+# Embedding模型配置（可选）
+# EMBEDDING_MODEL=shibing624/text2vec-base-chinese  # 中文优化模型（推荐，768维）
+# EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2  # 多语言模型（384维）
+# EMBEDDING_DIMENSION=768  # 向量维度（text2vec-base-chinese是768，MiniLM是384）
 ```
 
 ## 重要说明
@@ -65,6 +73,9 @@ PORT=8000
 # OCR配置（可选，如果不在PATH中）
 # TESSERACT_CMD=/usr/bin/tesseract
 # POPPLER_PATH=/usr/bin
+
+# HuggingFace镜像源配置（如果无法访问huggingface.co，推荐使用）
+# HF_ENDPOINT=https://hf-mirror.com
 EOF
 ```
 
